@@ -24,9 +24,9 @@ type config struct {
 }
 
 type token struct {
-	ID     int     `db:"token_id"`
-	Symbol string  `db:"symbol"`
-	USD    float64 `db:"usd"`
+	ID     int      `db:"token_id"`
+	Symbol string   `db:"symbol"`
+	USD    *float64 `db:"usd"`
 }
 
 type tokenPrice struct {
@@ -64,7 +64,13 @@ func main() {
 				fmt.Printf("ERROR: failed to update price for token %d %s, err: %v\n", tp.ID, tp.Symbol, err)
 				continue
 			}
-			fmt.Printf("Token %d %s price updated from %f to %f\n", tp.ID, tp.Symbol, token.USD, tp.USD)
+
+			tPrice := "null"
+			if token.USD != nil {
+				tPrice = fmt.Sprintf("%f", *token.USD)
+			}
+
+			fmt.Printf("Token %d %s price updated from %s to %f\n", tp.ID, tp.Symbol, tPrice, tp.USD)
 		}
 	}
 }
