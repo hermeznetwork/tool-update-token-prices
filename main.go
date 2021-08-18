@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/jmoiron/sqlx"
@@ -20,7 +21,8 @@ type config struct {
 	postgresPassword string
 	postgresDatabase string
 
-	priceUpdaterURL string
+	priceUpdaterURL    string
+	priceUpdaterAPIKey string
 }
 
 type token struct {
@@ -30,7 +32,6 @@ type token struct {
 }
 
 type tokenPrice struct {
-	ID     int     `json:"id"`
 	Symbol string  `json:"symbol"`
 	USD    float64 `json:"USD"`
 }
@@ -39,29 +40,54 @@ func main() {
 
 	cfg := getConfig()
 
+	fmt.Println("Connecting to DB...")
 	db, err := newDB(cfg)
 	if err != nil {
 		fmt.Println("failed to create db connection")
 		panic(err)
 	}
 
+	fmt.Println("Getting tokens from DB...")
 	tokens, err := getTokens(db)
 	if err != nil {
 		fmt.Println("failed to get tokens")
 		panic(err)
 	}
+	fmt.Println()
+	fmt.Printf("Database tokens found: %d\n", len(tokens))
+	sort.Slice(tokens, func(i, j int) bool {
+		return tokens[i].ID < tokens[j].ID
+	})
+	for _, token := range tokens {
+		tPrice := "null"
+		if token.USD != nil {
+			tPrice = fmt.Sprintf("%f", *token.USD)
+		}
+		fmt.Printf("%d %s %s\n", token.ID, token.Symbol, tPrice)
+	}
+	fmt.Println()
 
-	prices, err := getPrices(cfg)
+	fmt.Println("Getting tokens prices...")
+	pricesMap, prices, err := getPrices(cfg)
 	if err != nil {
 		fmt.Println("failed to get token prices")
 		panic(err)
 	}
+	fmt.Printf("Token prices found: %d\n", len(pricesMap))
+	sort.Slice(prices, func(i, j int) bool {
+		return prices[i].Symbol < prices[j].Symbol
+	})
+	for _, price := range prices {
+		fmt.Printf("%s %f\n", price.Symbol, price.USD)
+	}
+	fmt.Println()
 
+	fmt.Println("Updating token prices...")
 	for _, token := range tokens {
-		if tp, ok := prices[token.ID]; ok {
+		if tp, ok := pricesMap[token.Symbol]; ok {
 			err := updateToken(db, token.ID, tp.USD)
 			if err != nil {
-				fmt.Printf("ERROR: failed to update price for token %d %s, err: %v\n", tp.ID, tp.Symbol, err)
+				fmt.Printf("ERROR: failed to update price for token %d %s, err: %v\n", token.ID, token.Symbol, err)
 				continue
 			}
 
@@ -70,9 +96,13 @@ func main() {
 				tPrice = fmt.Sprintf("%f", *token.USD)
 			}
 
-			fmt.Printf("Token %d %s price updated from %s to %f\n", tp.ID, tp.Symbol, tPrice, tp.USD)
+			fmt.Printf("Token %d %s price updated from %s to %f\n", token.ID, token.Symbol, tPrice, tp.USD)
+		} else {
+			fmt.Printf("Token %d %s price not updated because price updater service did not provide the price for this token\n", token.ID, token.Symbol)
 		}
 	}
+	fmt.Println()
+	fmt.Println("Token prices update finished.")
 }
 
 func parseConfigValue(name, envValue string, flValue *string) string {
@@ -111,6 +141,9 @@ func getConfig() config {
 	priceUpdaterURLFromEnv := os.Getenv("PRICE_UPDATER_URL")
 	priceUpdaterURLFromFlag := flag.String("PRICE_UPDATER_URL", "", "price updater service url")
 
+	priceUpdaterAPIKeyFromEnv := os.Getenv("PRICE_UPDATER_API_KEY")
+	priceUpdaterAPIKeyFromFlag := flag.String("PRICE_UPDATER_API_KEY", "", "price updater service API Key")
+
 	flag.Parse()
 
 	return config{
@@ -120,7 +153,8 @@ func getConfig() config {
 		postgresPassword: parseConfigValue("POSTGRES_PASSWORD", postgresPasswordFromEnv, postgresPasswordFromFlag),
 		postgresDatabase: parseConfigValue("POSTGRES_DATABASE", postgresDBFromEnv, postgresDBFromFlag),
 
-		priceUpdaterURL: parseConfigValue("PRICE_UPDATER_URL", priceUpdaterURLFromEnv, priceUpdaterURLFromFlag),
+		priceUpdaterURL:    parseConfigValue("PRICE_UPDATER_URL", priceUpdaterURLFromEnv, priceUpdaterURLFromFlag),
+		priceUpdaterAPIKey: parseConfigValue("PRICE_UPDATER_API_KEY", priceUpdaterAPIKeyFromEnv, priceUpdaterAPIKeyFromFlag),
 	}
 }
 
@@ -142,42 +176,41 @@ func updateToken(db *sqlx.DB, id int, price float64) error {
 	return err
 }
 
-func getPrices(cfg config) (map[int]tokenPrice, error) {
+func getPrices(cfg config) (map[string]tokenPrice, []tokenPrice, error) {
 
 	u, err := url.Parse(cfg.priceUpdaterURL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	u.Path = "v1/tokens"
 
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	req.Header.Add("Origin", "any")
+	req.Header.Add("Origin", "tool-update-token-prices")
+	req.Header.Add("X-Api-Key", cfg.priceUpdaterAPIKey)
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("invalid status code %d", res.StatusCode)
+		return nil, nil, fmt.Errorf("invalid status code %d", res.StatusCode)
 	}
 
 	var data struct {
 		Tokens []tokenPrice `json:"tokens"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&data); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	tp := map[int]tokenPrice{}
+	tp := map[string]tokenPrice{}
 
-	fmt.Printf("Token prices found: %d\n", len(data.Tokens))
 	for _, tokenPrice := range data.Tokens {
-		tp[tokenPrice.ID] = tokenPrice
-		fmt.Printf("%d %s %f\n", tokenPrice.ID, tokenPrice.Symbol, tokenPrice.USD)
+		tp[tokenPrice.Symbol] = tokenPrice
 	}
 
-	return tp, nil
+	return tp, data.Tokens, nil
 }
